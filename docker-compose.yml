@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: linkedin-job-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
