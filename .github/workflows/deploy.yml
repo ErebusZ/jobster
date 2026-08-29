@@ -46,6 +46,6 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd ~/linkedin-job-bot
+            cd ~/jobster
             git pull origin main
             docker compose up -d --build

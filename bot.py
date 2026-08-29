@@ -1,11 +1,12 @@
+import asyncio
 import os
 import random
 import sqlite3
+
 import aiohttp
-import asyncio
 import discord
-from discord.ext import commands, tasks
 from bs4 import BeautifulSoup
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -55,7 +56,9 @@ async def fetch_new_jobs():
 
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, params=params, headers=headers, proxy=PROXY_URL, timeout=10) as resp:
+            async with session.get(
+                url, params=params, headers=headers, proxy=PROXY_URL, timeout=10
+            ) as resp:
                 if resp.status != 200:
                     print(f"HTTP Error: {resp.status}")
                     return []
@@ -88,7 +91,9 @@ async def fetch_new_jobs():
                             "location": loc_elem.text.strip() if loc_elem else LOCATION,
                             "url": job_url
                         })
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - keep the check loop alive on any
+            # unexpected network/parsing failure (LinkedIn markup or connectivity
+            # issues shouldn't crash the scheduled task), just log and retry next cycle
             print(f"Scraping error: {e}")
 
     return new_listings
