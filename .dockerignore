@@ -1,0 +1,9 @@
+.env
+.git
+.github
+.ruff_cache
+__pycache__
+*.pyc
+data
+job_alerts.db
+README.md
