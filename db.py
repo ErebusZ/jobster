@@ -6,26 +6,30 @@ models from models.py - callers (bot.py) never see a raw sqlite3.Row or
 write a query themselves.
 
 Three tables:
-  jobs          - every job the scraper has posted (shared across all users)
-  users         - a user is created lazily the first time they interact with
-                  the bot; their Discord ID is the only identity we need
-  applications  - one row per (user, job): the user's tracking status for it
+  jobs               - every job any source has returned (shared, deduped
+                        per (source, job_id) so the same posting on two
+                        sources is tracked separately)
+  users              - a user is created lazily the first time they
+                        interact with the bot; their Discord ID is the only
+                        identity we need
+  tracked_keywords   - one row per (user, keyword, location) subscription
 """
 
 import sqlite3
 from datetime import UTC, datetime
 
-from models import Job, ScrapedJob, Status, TrackedJob, UserStats
+from models import Job, ScrapedJob, TrackedKeyword
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    job_id TEXT NOT NULL,
     title TEXT NOT NULL,
     company TEXT,
     location TEXT,
     url TEXT NOT NULL,
-    message_id TEXT,
-    first_seen_at TEXT NOT NULL
+    first_seen_at TEXT NOT NULL,
+    PRIMARY KEY (source, job_id)
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -34,18 +38,17 @@ CREATE TABLE IF NOT EXISTS users (
     first_seen_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS applications (
+CREATE TABLE IF NOT EXISTS tracked_keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL REFERENCES users(discord_id),
-    job_id TEXT NOT NULL REFERENCES jobs(job_id),
-    status TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    location TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(user_id, job_id)
+    UNIQUE(user_id, keyword, location)
 );
 
-CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_message ON jobs(message_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_keywords_user ON tracked_keywords(user_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_keywords_kw_loc ON tracked_keywords(keyword, location);
 """
 
 
@@ -55,27 +58,23 @@ def _now() -> str:
 
 def _row_to_job(row: sqlite3.Row) -> Job:
     return Job(
-        ref=row["ref"],
+        source=row["source"],
         job_id=row["job_id"],
         title=row["title"],
         company=row["company"],
         location=row["location"],
         url=row["url"],
-        message_id=row["message_id"],
         first_seen_at=datetime.fromisoformat(row["first_seen_at"]),
     )
 
 
-def _row_to_tracked_job(row: sqlite3.Row) -> TrackedJob:
-    return TrackedJob(
-        ref=row["ref"],
-        job_id=row["job_id"],
-        title=row["title"],
-        company=row["company"],
+def _row_to_keyword(row: sqlite3.Row) -> TrackedKeyword:
+    return TrackedKeyword(
+        id=row["id"],
+        user_id=row["user_id"],
+        keyword=row["keyword"],
         location=row["location"],
-        url=row["url"],
-        status=Status(row["status"]),
-        updated_at=datetime.fromisoformat(row["updated_at"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 
@@ -89,81 +88,26 @@ class Database:
 
     # --- jobs -----------------------------------------------------------
 
-    def is_job_known(self, job_id: str) -> bool:
-        row = self._conn.execute("SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    def is_job_known(self, source: str, job_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM jobs WHERE source = ? AND job_id = ?", (source, job_id)
+        ).fetchone()
         return row is not None
 
-    def upsert_job(self, job: ScrapedJob, message_id: str | None = None) -> Job:
-        """Inserts a new job (or, if it already exists, just updates its
-        message_id). Returns the persisted Job, including its short `ref`."""
+    def upsert_job(self, job: ScrapedJob) -> Job:
         self._conn.execute(
             """
-            INSERT INTO jobs (job_id, title, company, location, url, message_id, first_seen_at)
+            INSERT INTO jobs (source, job_id, title, company, location, url, first_seen_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id) DO UPDATE SET message_id = excluded.message_id
+            ON CONFLICT(source, job_id) DO NOTHING
             """,
-            (job.job_id, job.title, job.company, job.location, job.url, message_id, _now()),
+            (job.source, job.job_id, job.title, job.company, job.location, job.url, _now()),
         )
         self._conn.commit()
-        return self.get_job_by_id(job.job_id)
-
-    def attach_message(self, job_id: str, message_id: str) -> None:
-        self._conn.execute("UPDATE jobs SET message_id = ? WHERE job_id = ?", (message_id, job_id))
-        self._conn.commit()
-
-    def get_job_by_message_id(self, message_id: str) -> Job | None:
         row = self._conn.execute(
-            "SELECT rowid AS ref, * FROM jobs WHERE message_id = ?", (str(message_id),)
+            "SELECT * FROM jobs WHERE source = ? AND job_id = ?", (job.source, job.job_id)
         ).fetchone()
-        return _row_to_job(row) if row else None
-
-    def get_job_by_id(self, job_id: str) -> Job | None:
-        row = self._conn.execute("SELECT rowid AS ref, * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-        return _row_to_job(row) if row else None
-
-    def get_job_by_ref(self, ref: int) -> Job | None:
-        row = self._conn.execute("SELECT rowid AS ref, * FROM jobs WHERE rowid = ?", (ref,)).fetchone()
-        return _row_to_job(row) if row else None
-
-    def autocomplete_jobs(self, user_id: int | str, query: str, limit: int = 25) -> list[TrackedJob | Job]:
-        """Jobs to suggest for /status's autocomplete.
-
-        Empty query: the user's own tracked jobs, most recently updated first -
-        this is what makes referencing "that job from last week" fast, no
-        scrolling the backlog. Non-empty query: also matches a typed #ref number.
-        """
-        query = query.strip().lstrip("#")
-
-        if not query:
-            rows = self._conn.execute(
-                """
-                SELECT j.rowid AS ref, j.*, a.status, a.updated_at
-                FROM applications a JOIN jobs j ON j.job_id = a.job_id
-                WHERE a.user_id = ?
-                ORDER BY a.updated_at DESC
-                LIMIT ?
-                """,
-                (str(user_id), limit),
-            ).fetchall()
-            if rows:
-                return [_row_to_tracked_job(r) for r in rows]
-            # user isn't tracking anything yet - fall back to the most recent postings
-            rows = self._conn.execute(
-                "SELECT rowid AS ref, * FROM jobs ORDER BY first_seen_at DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return [_row_to_job(r) for r in rows]
-
-        like = f"%{query}%"
-        rows = self._conn.execute(
-            """
-            SELECT rowid AS ref, * FROM jobs
-            WHERE CAST(rowid AS TEXT) = ? OR title LIKE ? OR company LIKE ?
-            ORDER BY first_seen_at DESC
-            LIMIT ?
-            """,
-            (query, like, like, limit),
-        ).fetchall()
-        return [_row_to_job(r) for r in rows]
+        return _row_to_job(row)
 
     # --- users ------------------------------------------------------------
 
@@ -178,56 +122,49 @@ class Database:
         )
         self._conn.commit()
 
-    # --- applications -----------------------------------------------------
+    # --- tracked keywords ---------------------------------------------------
 
-    def set_application_status(self, user_id: int | str, job_id: str, status: Status) -> Status | None:
-        """Upserts the (user, job) status. Returns the previous status, or None if this is new."""
-        row = self._conn.execute(
-            "SELECT status FROM applications WHERE user_id = ? AND job_id = ?",
-            (str(user_id), job_id),
-        ).fetchone()
-        previous = Status(row["status"]) if row else None
+    def add_tracked_keyword(self, user_id: int | str, keyword: str, location: str) -> bool:
+        """Returns True if newly added, False if this user already tracked it."""
+        keyword, location = keyword.strip().lower(), location.strip().lower()
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO tracked_keywords (user_id, keyword, location, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(user_id), keyword, location, _now()),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False  # UNIQUE(user_id, keyword, location) already exists
 
-        now = _now()
-        self._conn.execute(
-            """
-            INSERT INTO applications (user_id, job_id, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, job_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
-            """,
-            (str(user_id), job_id, status.value, now, now),
+    def remove_tracked_keyword(self, user_id: int | str, keyword_id: int) -> bool:
+        """Returns True if a row was deleted. Scoped to user_id so you can
+        only ever remove your own subscriptions."""
+        cur = self._conn.execute(
+            "DELETE FROM tracked_keywords WHERE id = ? AND user_id = ?", (keyword_id, str(user_id))
         )
         self._conn.commit()
-        return previous
+        return cur.rowcount > 0
 
-    def get_user_applications(self, user_id: int | str, status: Status | None = None) -> list[TrackedJob]:
-        query = """
-            SELECT a.status, a.updated_at, j.rowid AS ref, j.job_id, j.title, j.company, j.location, j.url
-            FROM applications a JOIN jobs j ON j.job_id = a.job_id
-            WHERE a.user_id = ?
-        """
-        params: list = [str(user_id)]
-        if status:
-            query += " AND a.status = ?"
-            params.append(status.value)
-        query += " ORDER BY a.updated_at DESC"
-        rows = self._conn.execute(query, params).fetchall()
-        return [_row_to_tracked_job(r) for r in rows]
-
-    def get_user_stats(self, user_id: int | str) -> UserStats:
+    def get_user_keywords(self, user_id: int | str) -> list[TrackedKeyword]:
         rows = self._conn.execute(
-            "SELECT status, COUNT(*) as n FROM applications WHERE user_id = ? GROUP BY status",
-            (str(user_id),),
+            "SELECT * FROM tracked_keywords WHERE user_id = ? ORDER BY created_at", (str(user_id),)
         ).fetchall()
-        counts = dict.fromkeys(Status, 0)
-        for row in rows:
-            counts[Status(row["status"])] = row["n"]
+        return [_row_to_keyword(r) for r in rows]
 
-        total = sum(counts.values())
-        applied_or_further = (
-            counts[Status.APPLIED] + counts[Status.INTERVIEW] + counts[Status.OFFER] + counts[Status.REJECTED]
-        )
-        responses = counts[Status.INTERVIEW] + counts[Status.OFFER] + counts[Status.REJECTED]
-        response_rate = round(responses / applied_or_further * 100, 1) if applied_or_further else 0.0
+    def get_distinct_search_targets(self) -> list[tuple[str, str]]:
+        """Every unique (keyword, location) pair across all users - what
+        actually gets searched. Two users tracking the same thing means one
+        search, not two."""
+        rows = self._conn.execute("SELECT DISTINCT keyword, location FROM tracked_keywords").fetchall()
+        return [(r["keyword"], r["location"]) for r in rows]
 
-        return UserStats(counts=counts, total=total, response_rate=response_rate)
+    def get_users_tracking(self, keyword: str, location: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT user_id FROM tracked_keywords WHERE keyword = ? AND location = ?",
+            (keyword.strip().lower(), location.strip().lower()),
+        ).fetchall()
+        return [r["user_id"] for r in rows]
