@@ -2,7 +2,6 @@ import asyncio
 
 import tls_client
 from bs4 import BeautifulSoup
-
 from models import ScrapedJob
 
 from .base import JobSource
