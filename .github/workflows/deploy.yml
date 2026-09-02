@@ -8,7 +8,7 @@ on:
 
 jobs:
   deploy:
-    name: Deploy to Oracle VM
+    name: Deploy
     runs-on: ubuntu-latest
     # Only deploy if the CI run that just finished (on main) actually succeeded.
     # workflow_run always fires on completion, success or failure - this gate
@@ -22,6 +22,8 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -euo pipefail
+            export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             cd ~/jobster
             git pull origin main
             docker compose up -d --build

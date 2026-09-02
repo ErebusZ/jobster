@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import random
 from datetime import UTC, datetime
@@ -85,6 +86,7 @@ async def run_search_cycle() -> list[tuple[Job, set[str]]]:
 
 
 _last_check_at: datetime | None = None
+
 
 
 async def run_job_check():
