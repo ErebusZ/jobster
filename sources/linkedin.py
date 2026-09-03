@@ -1,9 +1,8 @@
 import aiohttp
+from base import JobSource
 from bs4 import BeautifulSoup
 
 from models import ScrapedJob
-
-from .base import JobSource
 
 
 class LinkedInSource(JobSource):
