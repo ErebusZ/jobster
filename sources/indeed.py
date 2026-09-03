@@ -4,7 +4,7 @@ import tls_client
 from bs4 import BeautifulSoup
 
 from models import ScrapedJob
-from .base import JobSource
+from base import JobSource
 
 _HEADERS = {
     # Truncated UAs (missing the "Chrome/... Safari/..." suffix) are a
