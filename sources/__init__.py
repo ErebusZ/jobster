@@ -4,9 +4,9 @@ To add a new board: write a JobSource subclass in this package, then add it
 to build_sources() below. Nothing else in the codebase needs to change.
 """
 
-from .base import JobSource
-from .indeed import IndeedSource
-from .linkedin import LinkedInSource
+from sources.base import JobSource
+from sources.indeed import IndeedSource
+from sources.linkedin import LinkedInSource
 
 __all__ = ["IndeedSource", "JobSource", "LinkedInSource", "build_sources"]
 
