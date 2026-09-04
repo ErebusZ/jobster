@@ -1,10 +1,10 @@
 import asyncio
 
 import tls_client
-from base import JobSource
 from bs4 import BeautifulSoup
 
 from models import ScrapedJob
+from sources.base import JobSource
 
 _HEADERS = {
     # Truncated UAs (missing the "Chrome/... Safari/..." suffix) are a
